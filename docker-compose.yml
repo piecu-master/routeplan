@@ -2,7 +2,6 @@ services:
   backend:
     build: ./backend
     environment:
-      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
       - OSRM_URL=${OSRM_URL:-http://router.project-osrm.org}
     restart: unless-stopped
     network_mode: host
