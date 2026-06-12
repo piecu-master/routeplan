@@ -14,8 +14,6 @@ export default function App() {
   const [error, setError] = useState("");
   const mapRef = useRef(null);
   const mapInstanceRef = useRef(null);
-  const routeLayerRef = useRef(null);
-  const markersLayerRef = useRef(null);
 
   // Initialize map
   useEffect(() => {
@@ -28,8 +26,6 @@ export default function App() {
     }).addTo(map);
     
     mapInstanceRef.current = map;
-    routeLayerRef.current = L.layerGroup().addTo(map);
-    markersLayerRef.current = L.layerGroup().addTo(map);
   }, []);
 
   const plan = async () => {
@@ -46,53 +42,12 @@ export default function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Request failed");
       setResult(data);
-      // draw on map
-      drawRouteOnMap(data);
     } catch (e) {
       setError(e.message);
     } finally {
       setLoading(false);
     }
   };
-
-  function weatherCodeToEmoji(code) {
-    // simple mapping: 0..3 clear/partly cloudy, others -> rain/snow/fog
-    if (code === 0 || code === 1 || code === 2 || code === 3) return "☀️";
-    if (code >= 51 && code <= 67) return "🌧️";
-    if (code >= 71 && code <= 77) return "❄️";
-    if (code >= 80 && code <= 82) return "🌧️";
-    return "🌫️";
-  }
-
-  function clearLayers() {
-    if (!routeLayerRef.current || !markersLayerRef.current) return;
-    routeLayerRef.current.clearLayers();
-    markersLayerRef.current.clearLayers();
-  }
-
-  function drawRouteOnMap(data) {
-    if (!mapInstanceRef.current) return;
-    clearLayers();
-    const map = mapInstanceRef.current;
-
-    // draw geometry if present
-    if (data.route_geometry && data.route_geometry.coordinates) {
-      const latlngs = data.route_geometry.coordinates.map((c) => [c[1], c[0]]);
-      const poly = L.polyline(latlngs, { color: "#1976d2", weight: 4 }).addTo(routeLayerRef.current);
-      map.fitBounds(poly.getBounds(), { padding: [40, 40] });
-    }
-
-    // draw sample markers
-    if (data.samples && Array.isArray(data.samples)) {
-      data.samples.forEach((s) => {
-        const emoji = weatherCodeToEmoji(s.weather_code);
-        const marker = L.marker([s.lat, s.lon], {
-          icon: L.divIcon({ className: "weather-marker", html: `<div style="font-size:20px">${emoji}</div>` })
-        }).addTo(markersLayerRef.current);
-        marker.bindPopup(`${emoji} ${s.arrival}`);
-      });
-    }
-  }
 
   return (
     <div style={s.shell}>
@@ -164,6 +119,29 @@ export default function App() {
               <Stat label="Traffic" value={result.traffic_summary} />
             </div>
             <p style={s.advice}>{result.advice}</p>
+            
+            {result.safety_check !== "ok" && (
+              <div style={s.safetyWarning}>
+                ⚠️ {result.safety_check}
+              </div>
+            )}
+
+            {result.candidates && result.candidates.length > 0 && (
+              <div style={s.candidatesSection}>
+                <p style={s.label}>ALTERNATIVE TIMES (ranked)</p>
+                <div style={s.candidatesList}>
+                  {result.candidates.slice(0, 5).map((cand, i) => (
+                    <div key={i} style={s.candidateItem}>
+                      <div style={s.candidateHeader}>
+                        <span style={s.candidateTime}>{new Date(cand.depart_iso).toLocaleTimeString()}</span>
+                        <span style={s.candidateScore}>{(cand.score * 100).toFixed(0)}%</span>
+                      </div>
+                      <span style={s.candidateReason}>{cand.reason}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </section>
         )}
       </main>
@@ -199,4 +177,12 @@ const s = {
   statLabel: { display: "block", fontSize: 10, fontFamily: "var(--mono)", color: "var(--muted)", marginBottom: 4 },
   statValue: { fontSize: 14, color: "var(--text)" },
   advice: { fontSize: 14, color: "var(--text)", lineHeight: 1.7, borderTop: "1px solid var(--border)", paddingTop: 14 },
+  safetyWarning: { marginTop: 16, padding: 12, background: "var(--bg)", border: "1px solid var(--error)", borderRadius: 8, color: "var(--error)", fontSize: 12, fontFamily: "var(--mono)" },
+  candidatesSection: { marginTop: 20, borderTop: "1px solid var(--border)", paddingTop: 20 },
+  candidatesList: { display: "flex", flexDirection: "column", gap: 8 },
+  candidateItem: { background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 8, padding: 12 },
+  candidateHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 },
+  candidateTime: { fontFamily: "var(--mono)", fontSize: 13, fontWeight: 500, color: "var(--text)" },
+  candidateScore: { fontSize: 12, fontWeight: 600, color: "var(--accent)" },
+  candidateReason: { fontSize: 12, color: "var(--muted)", fontStyle: "italic" },
 };
