@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
 
 const API = "/api";
 
@@ -9,6 +11,24 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const mapRef = useRef(null);
+  const mapInstanceRef = useRef(null);
+
+  const mapRef = useRef(null);
+  const mapInstanceRef = useRef(null);
+
+  // Initialize map
+  useEffect(() => {
+    if (!mapRef.current || mapInstanceRef.current) return;
+    
+    const map = L.map(mapRef.current).setView([51.9194, 19.1451], 6); // Center on Poland
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+    
+    mapInstanceRef.current = map;
+  }, []);
 
   const plan = async () => {
     if (!origin.trim() || !destination.trim()) return;
@@ -79,6 +99,8 @@ export default function App() {
           {error && <p style={s.error}>{error}</p>}
         </section>
 
+        <div style={s.mapContainer} ref={mapRef}></div>
+
         {result && (
           <section style={s.card}>
             <p style={s.label}>RECOMMENDATION</p>
@@ -113,6 +135,7 @@ const s = {
   tagline: { fontSize: 12, fontFamily: "var(--mono)", color: "var(--muted)" },
   main: { display: "flex", flexDirection: "column", gap: 16, padding: "20px 0" },
   card: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 20 },
+  mapContainer: { height: 400, borderRadius: 10, border: "1px solid var(--border)", marginBottom: 16 },
   label: { fontFamily: "var(--mono)", fontSize: 10, color: "var(--muted)", letterSpacing: "0.1em", marginBottom: 16 },
   field: { marginBottom: 12 },
   fieldLabel: { display: "block", fontSize: 12, color: "var(--muted)", marginBottom: 6, fontFamily: "var(--mono)" },
