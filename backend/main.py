@@ -1,12 +1,11 @@
 import os
 import httpx
-import asyncio
-import time
+import json
 from datetime import datetime, timedelta, timezone
+from typing import Optional, List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict, Optional
 
 app = FastAPI(title="RoutePlan API")
 
@@ -20,8 +19,9 @@ app.add_middleware(
 OSRM_URL = os.environ.get("OSRM_URL", "http://router.project-osrm.org")
 NOMINATIM_URL = "https://nominatim.openstreetmap.org"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-WEATHER_CACHE: dict = {}
-CACHE_TTL = 60 * 60  # 1 hour
+LLM_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+LLM_MODEL = "gpt-4o-mini"
+USE_LLM_RERANKER = os.environ.get("USE_LLM_RERANKER", "false").lower() == "true"
 
 
 class RouteRequest(BaseModel):
@@ -30,6 +30,12 @@ class RouteRequest(BaseModel):
     depart_at: str | None = None  # ISO datetime, optional
     tolerance_hours: int = 0  # +/- hours to search (0-8)
     granularity_min: int = 15  # minutes between candidate departures
+
+
+class CandidateInfo(BaseModel):
+    depart_iso: str
+    score: float
+    reason: str
 
 
 class RouteResponse(BaseModel):
@@ -41,8 +47,8 @@ class RouteResponse(BaseModel):
     weather_summary: str
     traffic_summary: str
     advice: str
-    route_geometry: Optional[Dict] = None
-    samples: List[Dict] = []
+    candidates: List[CandidateInfo] = []
+    safety_check: str = "ok"
 
 
 @app.get("/health")
@@ -88,55 +94,44 @@ def _is_good_weather_code(code: int) -> bool:
         return False
 
 
+def _weather_code_description(code: int) -> str:
+    """Human-readable description of weather code."""
+    if code in (0, 1):
+        return "clear/sunny"
+    elif code in (2, 3):
+        return "cloudy"
+    elif code in (51, 53, 55):
+        return "light drizzle"
+    elif code in (61, 63, 65):
+        return "rain"
+    elif code in (71, 73, 75):
+        return "snow"
+    elif code in (80, 81, 82):
+        return "rain showers"
+    elif code in (95, 96, 99):
+        return "thunderstorm/severe"
+    else:
+        return "fog/unknown"
+
+
 async def _get_weather_code_at(lat: float, lon: float, when: datetime) -> int:
     """Query Open-Meteo hourly weathercode and return nearest-hour code."""
     date_str = when.date().isoformat()
-    cache_key = f"{lat:.4f},{lon:.4f},{date_str}"
-    now_ts = time.time()
-    # return cached if fresh
-    cached = WEATHER_CACHE.get(cache_key)
-    if cached and (now_ts - cached[0]) < CACHE_TTL:
-        data = cached[1]
-    else:
-        # retry on 429 with exponential backoff
-        backoff = 1
-        last_exc = None
-        for attempt in range(4):
-            try:
-                async with httpx.AsyncClient() as client:
-                    res = await client.get(
-                        OPEN_METEO_URL,
-                        params={
-                            "latitude": lat,
-                            "longitude": lon,
-                            "hourly": "weathercode",
-                            "timezone": "UTC",
-                            "start_date": date_str,
-                            "end_date": date_str,
-                        },
-                        timeout=10,
-                    )
-                    if res.status_code == 429:
-                        last_exc = httpx.HTTPStatusError("429 Too Many Requests", request=res.request, response=res)
-                        await asyncio.sleep(backoff)
-                        backoff *= 2
-                        continue
-                    res.raise_for_status()
-                    data = res.json()
-                    # cache successful response
-                    WEATHER_CACHE[cache_key] = (time.time(), data)
-                    last_exc = None
-                    break
-            except httpx.HTTPStatusError as e:
-                last_exc = e
-                await asyncio.sleep(backoff)
-                backoff *= 2
-            except Exception as e:
-                last_exc = e
-                await asyncio.sleep(backoff)
-                backoff *= 2
-        if last_exc is not None:
-            raise last_exc
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            OPEN_METEO_URL,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": "weathercode",
+                "timezone": "UTC",
+                "start_date": date_str,
+                "end_date": date_str,
+            },
+            timeout=10,
+        )
+        res.raise_for_status()
+        data = res.json()
         times = data.get("hourly", {}).get("time", [])
         codes = data.get("hourly", {}).get("weathercode", [])
         if not times or not codes:
@@ -179,6 +174,79 @@ async def get_weather(lat: float, lon: float) -> str:
         temp = current.get("temperature_2m", "N/A")
         wind = current.get("wind_speed_10m", "N/A")
         return f"{temp}°C, wind {wind}km/h"
+
+
+async def rerank_with_llm(candidates_data: List, route_info: dict) -> Optional[dict]:
+    """Call LLM to rerank and score candidates with explainability & safety.
+    Returns {best_idx, candidates_scores} or None on failure.
+    """
+    if not USE_LLM_RERANKER or not LLM_API_KEY:
+        return None
+
+    candidates_json = []
+    for i, cand in enumerate(candidates_data):
+        samples_desc = []
+        for j, code in enumerate(cand["codes"]):
+            arrival = cand["arrivals"][j]
+            samples_desc.append({
+                "point": j,
+                "weather": _weather_code_description(code),
+                "weather_code": code,
+                "arrival_iso": arrival.isoformat(),
+            })
+        candidates_json.append({
+            "id": i,
+            "depart_iso": cand["depart"].isoformat(),
+            "samples": samples_desc,
+        })
+
+    prompt = f"""Score these route departure candidates 0.0-1.0 (best=1.0, worst=0.0).
+
+Route: {route_info['origin']} → {route_info['destination']}
+Duration: {route_info['duration_min']} min
+
+RUBRIC:
+- Severe (codes 95-99): 0.0
+- Snow (71-77): 0.1-0.3
+- Heavy rain (65): 0.2-0.4
+- Light rain (61-63): 0.4-0.6
+- Drizzle (51-55): 0.6-0.7
+- Cloudy (2-3): 0.7-0.8
+- Clear (0-1): 0.9-1.0
+
+SAFETY RULE: Never score >0.7 if ANY checkpoint has severe weather (95-99).
+
+Candidates:
+{json.dumps(candidates_json, indent=2)}
+
+Return JSON only:
+{{
+  "candidates": [{{"id": 0, "score": 0.75, "reason": "reason"}}, ...],
+  "best_id": 0,
+  "safety_notes": "any warnings or 'none'"
+}}"""
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                json={
+                    "model": LLM_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                    "max_tokens": 1000,
+                },
+                timeout=30,
+            )
+            res.raise_for_status()
+            data = res.json()
+            content = data["choices"][0]["message"]["content"]
+            result = json.loads(content)
+            return result
+    except Exception as e:
+        print(f"LLM reranker error: {e}")
+        return None
 
 
 @app.post("/route", response_model=RouteResponse)
@@ -248,31 +316,84 @@ async def plan_route(req: RouteRequest):
         best = None
         best_score = -1.0
         best_details = None
+        all_candidates = []
 
         # evaluate candidates
         for cand in candidates:
             good = 0
             total = len(sample_points)
-            sample_codes = []
+            cand_codes = []
+            cand_arrivals = []
             # assume linear time distribution along route
             for i, (plat, plon) in enumerate(sample_points):
                 frac = 0.0 if total == 1 else (i / (total - 1))
                 arrival = cand + timedelta(seconds=duration_seconds * frac)
                 code = await _get_weather_code_at(plat, plon, arrival)
-                sample_codes.append({"lat": plat, "lon": plon, "weather_code": code, "arrival": arrival.isoformat()})
+                cand_codes.append(code)
+                cand_arrivals.append(arrival)
                 if _is_good_weather_code(code):
                     good += 1
 
             score = good / total if total > 0 else 0.0
+            all_candidates.append({
+                "depart": cand,
+                "codes": cand_codes,
+                "arrivals": cand_arrivals,
+                "det_score": score
+            })
             if score > best_score:
                 best_score = score
                 best = cand
                 best_details = {"good": good, "total": total}
-                best_sample_codes = sample_codes
+
+        # Try LLM reranking if enabled
+        llm_result = await rerank_with_llm(
+            all_candidates,
+            {
+                "origin": req.origin,
+                "destination": req.destination,
+                "duration_min": duration_minutes
+            }
+        )
+
+        safety_check = "ok"
+        candidates_info = []
+        if llm_result:
+            # Use LLM scores
+            try:
+                best_idx = llm_result.get("best_id", 0)
+                if 0 <= best_idx < len(all_candidates):
+                    best = all_candidates[best_idx]["depart"]
+                    best_score = next((c["score"] for c in llm_result.get("candidates", []) if c.get("id") == best_idx), best_score)
+                    best_details = {"good": best_details.get("good", 0), "total": best_details.get("total", 1)}
+                
+                safety_notes = llm_result.get("safety_notes", "")
+                if safety_notes and safety_notes.lower() != "none":
+                    safety_check = f"warning: {safety_notes}"
+                
+                # Build candidate info for response
+                for cand_rec in llm_result.get("candidates", []):
+                    cand_idx = cand_rec.get("id", 0)
+                    if 0 <= cand_idx < len(all_candidates):
+                        candidates_info.append(CandidateInfo(
+                            depart_iso=all_candidates[cand_idx]["depart"].isoformat(),
+                            score=cand_rec.get("score", 0.0),
+                            reason=cand_rec.get("reason", "")
+                        ))
+            except Exception as e:
+                print(f"Failed to use LLM result: {e}")
+                safety_check = "llm_failed"
+        else:
+            # Fallback: use deterministic scores
+            for i, cand in enumerate(all_candidates):
+                candidates_info.append(CandidateInfo(
+                    depart_iso=cand["depart"].isoformat(),
+                    score=cand["det_score"],
+                    reason=f"{int(cand['det_score']*100)}% good checkpoints"
+                ))
 
         recommended_depart_at = best.isoformat() if best is not None else desired.isoformat()
-
-        weather_summary = f"{int(best_score*100)}% of sampled points good ({best_details['good']}/{best_details['total']})"
+        weather_summary = f"{int(best_score*100)}% of sampled points good" if llm_result is None else f"LLM scored {int(best_score*100)}/100"
 
         return RouteResponse(
             origin=req.origin,
@@ -283,8 +404,8 @@ async def plan_route(req: RouteRequest):
             weather_summary=weather_summary,
             traffic_summary="OSRM routing (no live traffic)",
             advice=f"Recommended depart: {recommended_depart_at} (maximizes clear conditions)",
-            route_geometry=geom,
-            samples=best_sample_codes if 'best_sample_codes' in locals() else []
+            candidates=candidates_info,
+            safety_check=safety_check
         )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=500, detail=f"Route service error: {str(e)}")
