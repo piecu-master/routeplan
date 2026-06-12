@@ -8,12 +8,10 @@ export default function App() {
   const [origin, setOrigin] = useState("");
   const [destination, setDestination] = useState("");
   const [departAt, setDepartAt] = useState("");
+  const [toleranceHours, setToleranceHours] = useState(2);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const mapRef = useRef(null);
-  const mapInstanceRef = useRef(null);
-
   const mapRef = useRef(null);
   const mapInstanceRef = useRef(null);
 
@@ -39,7 +37,7 @@ export default function App() {
       const res = await fetch(`${API}/route`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ origin, destination, depart_at: departAt || null }),
+        body: JSON.stringify({ origin, destination, depart_at: departAt || null, tolerance_hours: parseInt(toleranceHours, 10) || 0, granularity_min: 15 }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Request failed");
@@ -90,6 +88,15 @@ export default function App() {
               value={departAt}
               onChange={(e) => setDepartAt(e.target.value)}
             />
+          </div>
+
+          <div style={s.field}>
+            <label style={s.fieldLabel}>Tolerance ± hours</label>
+            <select style={s.input} value={toleranceHours} onChange={(e) => setToleranceHours(e.target.value)}>
+              {[0,1,2,3,4,5,6,7,8].map((h) => (
+                <option key={h} value={h}>{`± ${h} h`}</option>
+              ))}
+            </select>
           </div>
 
           <button style={s.btn} onClick={plan} disabled={loading || !origin || !destination}>
