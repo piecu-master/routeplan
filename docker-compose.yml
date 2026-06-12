@@ -1,0 +1,16 @@
+services:
+  backend:
+    build: ./backend
+    environment:
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
+      - GOOGLEMAPS_API_KEY=${GOOGLEMAPS_API_KEY}
+    restart: unless-stopped
+    network_mode: host
+
+  frontend:
+    build: ./frontend
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - DOCQA_PASSWORD=${APP_PASSWORD}
+      - DOCQA_USER=${APP_USER:-admin}

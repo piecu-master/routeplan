@@ -1,0 +1,127 @@
+import { useState } from "react";
+
+const API = "/api";
+
+export default function App() {
+  const [origin, setOrigin] = useState("");
+  const [destination, setDestination] = useState("");
+  const [departAt, setDepartAt] = useState("");
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const plan = async () => {
+    if (!origin.trim() || !destination.trim()) return;
+    setLoading(true);
+    setError("");
+    setResult(null);
+    try {
+      const res = await fetch(`${API}/route`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ origin, destination, depart_at: departAt || null }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Request failed");
+      setResult(data);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={s.shell}>
+      <header style={s.header}>
+        <span style={s.logo}>RoutePlan</span>
+        <span style={s.tagline}>Smart travel timing</span>
+      </header>
+
+      <main style={s.main}>
+        <section style={s.card}>
+          <p style={s.label}>PLAN YOUR ROUTE</p>
+
+          <div style={s.field}>
+            <label style={s.fieldLabel}>Origin</label>
+            <input
+              style={s.input}
+              placeholder="e.g. Warsaw, Poland"
+              value={origin}
+              onChange={(e) => setOrigin(e.target.value)}
+            />
+          </div>
+
+          <div style={s.field}>
+            <label style={s.fieldLabel}>Destination</label>
+            <input
+              style={s.input}
+              placeholder="e.g. Kraków, Poland"
+              value={destination}
+              onChange={(e) => setDestination(e.target.value)}
+            />
+          </div>
+
+          <div style={s.field}>
+            <label style={s.fieldLabel}>Depart at (optional)</label>
+            <input
+              style={s.input}
+              type="datetime-local"
+              value={departAt}
+              onChange={(e) => setDepartAt(e.target.value)}
+            />
+          </div>
+
+          <button style={s.btn} onClick={plan} disabled={loading || !origin || !destination}>
+            {loading ? "Analysing…" : "Find best time"}
+          </button>
+
+          {error && <p style={s.error}>{error}</p>}
+        </section>
+
+        {result && (
+          <section style={s.card}>
+            <p style={s.label}>RECOMMENDATION</p>
+            <div style={s.resultGrid}>
+              <Stat label="Depart at" value={result.recommended_depart_at} />
+              <Stat label="Duration" value={`${result.duration_minutes} min`} />
+              <Stat label="Distance" value={`${result.distance_km} km`} />
+              <Stat label="Weather" value={result.weather_summary} />
+              <Stat label="Traffic" value={result.traffic_summary} />
+            </div>
+            <p style={s.advice}>{result.advice}</p>
+          </section>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function Stat({ label, value }) {
+  return (
+    <div style={s.stat}>
+      <span style={s.statLabel}>{label}</span>
+      <span style={s.statValue}>{value}</span>
+    </div>
+  );
+}
+
+const s = {
+  shell: { maxWidth: 680, margin: "0 auto", padding: "0 16px", minHeight: "100vh" },
+  header: { display: "flex", alignItems: "baseline", gap: 12, padding: "24px 0 20px", borderBottom: "1px solid var(--border)" },
+  logo: { fontFamily: "var(--mono)", fontWeight: 600, fontSize: 18, color: "var(--text)" },
+  tagline: { fontSize: 12, fontFamily: "var(--mono)", color: "var(--muted)" },
+  main: { display: "flex", flexDirection: "column", gap: 16, padding: "20px 0" },
+  card: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: 20 },
+  label: { fontFamily: "var(--mono)", fontSize: 10, color: "var(--muted)", letterSpacing: "0.1em", marginBottom: 16 },
+  field: { marginBottom: 12 },
+  fieldLabel: { display: "block", fontSize: 12, color: "var(--muted)", marginBottom: 6, fontFamily: "var(--mono)" },
+  input: { width: "100%", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 8, color: "var(--text)", fontSize: 14, padding: "9px 12px", outline: "none" },
+  btn: { marginTop: 8, width: "100%", background: "var(--accent)", border: "none", borderRadius: 8, color: "#fff", fontSize: 14, fontWeight: 500, padding: "11px 0" },
+  error: { marginTop: 12, color: "var(--error)", fontSize: 13, fontFamily: "var(--mono)" },
+  resultGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 },
+  stat: { background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 14px" },
+  statLabel: { display: "block", fontSize: 10, fontFamily: "var(--mono)", color: "var(--muted)", marginBottom: 4 },
+  statValue: { fontSize: 14, color: "var(--text)" },
+  advice: { fontSize: 14, color: "var(--text)", lineHeight: 1.7, borderTop: "1px solid var(--border)", paddingTop: 14 },
+};
