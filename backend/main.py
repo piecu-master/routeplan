@@ -1,5 +1,7 @@
 import os
 import httpx
+import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +20,8 @@ app.add_middleware(
 OSRM_URL = os.environ.get("OSRM_URL", "http://router.project-osrm.org")
 NOMINATIM_URL = "https://nominatim.openstreetmap.org"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_CACHE: dict = {}
+CACHE_TTL = 60 * 60  # 1 hour
 
 
 class RouteRequest(BaseModel):
@@ -87,21 +91,52 @@ def _is_good_weather_code(code: int) -> bool:
 async def _get_weather_code_at(lat: float, lon: float, when: datetime) -> int:
     """Query Open-Meteo hourly weathercode and return nearest-hour code."""
     date_str = when.date().isoformat()
-    async with httpx.AsyncClient() as client:
-        res = await client.get(
-            OPEN_METEO_URL,
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "hourly": "weathercode",
-                "timezone": "UTC",
-                "start_date": date_str,
-                "end_date": date_str,
-            },
-            timeout=10,
-        )
-        res.raise_for_status()
-        data = res.json()
+    cache_key = f"{lat:.4f},{lon:.4f},{date_str}"
+    now_ts = time.time()
+    # return cached if fresh
+    cached = WEATHER_CACHE.get(cache_key)
+    if cached and (now_ts - cached[0]) < CACHE_TTL:
+        data = cached[1]
+    else:
+        # retry on 429 with exponential backoff
+        backoff = 1
+        last_exc = None
+        for attempt in range(4):
+            try:
+                async with httpx.AsyncClient() as client:
+                    res = await client.get(
+                        OPEN_METEO_URL,
+                        params={
+                            "latitude": lat,
+                            "longitude": lon,
+                            "hourly": "weathercode",
+                            "timezone": "UTC",
+                            "start_date": date_str,
+                            "end_date": date_str,
+                        },
+                        timeout=10,
+                    )
+                    if res.status_code == 429:
+                        last_exc = httpx.HTTPStatusError("429 Too Many Requests", request=res.request, response=res)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    res.raise_for_status()
+                    data = res.json()
+                    # cache successful response
+                    WEATHER_CACHE[cache_key] = (time.time(), data)
+                    last_exc = None
+                    break
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            except Exception as e:
+                last_exc = e
+                await asyncio.sleep(backoff)
+                backoff *= 2
+        if last_exc is not None:
+            raise last_exc
         times = data.get("hourly", {}).get("time", [])
         codes = data.get("hourly", {}).get("weathercode", [])
         if not times or not codes:
