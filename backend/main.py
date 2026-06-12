@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List, Dict, Optional
 
 app = FastAPI(title="RoutePlan API")
 
@@ -36,6 +37,8 @@ class RouteResponse(BaseModel):
     weather_summary: str
     traffic_summary: str
     advice: str
+    route_geometry: Optional[Dict] = None
+    samples: List[Dict] = []
 
 
 @app.get("/health")
@@ -215,11 +218,13 @@ async def plan_route(req: RouteRequest):
         for cand in candidates:
             good = 0
             total = len(sample_points)
+            sample_codes = []
             # assume linear time distribution along route
             for i, (plat, plon) in enumerate(sample_points):
                 frac = 0.0 if total == 1 else (i / (total - 1))
                 arrival = cand + timedelta(seconds=duration_seconds * frac)
                 code = await _get_weather_code_at(plat, plon, arrival)
+                sample_codes.append({"lat": plat, "lon": plon, "weather_code": code, "arrival": arrival.isoformat()})
                 if _is_good_weather_code(code):
                     good += 1
 
@@ -228,6 +233,7 @@ async def plan_route(req: RouteRequest):
                 best_score = score
                 best = cand
                 best_details = {"good": good, "total": total}
+                best_sample_codes = sample_codes
 
         recommended_depart_at = best.isoformat() if best is not None else desired.isoformat()
 
@@ -241,7 +247,9 @@ async def plan_route(req: RouteRequest):
             distance_km=round(distance_km, 2),
             weather_summary=weather_summary,
             traffic_summary="OSRM routing (no live traffic)",
-            advice=f"Recommended depart: {recommended_depart_at} (maximizes clear conditions)"
+            advice=f"Recommended depart: {recommended_depart_at} (maximizes clear conditions)",
+            route_geometry=geom,
+            samples=best_sample_codes if 'best_sample_codes' in locals() else []
         )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=500, detail=f"Route service error: {str(e)}")

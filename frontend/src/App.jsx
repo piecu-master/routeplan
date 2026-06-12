@@ -14,6 +14,8 @@ export default function App() {
   const [error, setError] = useState("");
   const mapRef = useRef(null);
   const mapInstanceRef = useRef(null);
+  const routeLayerRef = useRef(null);
+  const markersLayerRef = useRef(null);
 
   // Initialize map
   useEffect(() => {
@@ -26,6 +28,8 @@ export default function App() {
     }).addTo(map);
     
     mapInstanceRef.current = map;
+    routeLayerRef.current = L.layerGroup().addTo(map);
+    markersLayerRef.current = L.layerGroup().addTo(map);
   }, []);
 
   const plan = async () => {
@@ -42,12 +46,53 @@ export default function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Request failed");
       setResult(data);
+      // draw on map
+      drawRouteOnMap(data);
     } catch (e) {
       setError(e.message);
     } finally {
       setLoading(false);
     }
   };
+
+  function weatherCodeToEmoji(code) {
+    // simple mapping: 0..3 clear/partly cloudy, others -> rain/snow/fog
+    if (code === 0 || code === 1 || code === 2 || code === 3) return "☀️";
+    if (code >= 51 && code <= 67) return "🌧️";
+    if (code >= 71 && code <= 77) return "❄️";
+    if (code >= 80 && code <= 82) return "🌧️";
+    return "🌫️";
+  }
+
+  function clearLayers() {
+    if (!routeLayerRef.current || !markersLayerRef.current) return;
+    routeLayerRef.current.clearLayers();
+    markersLayerRef.current.clearLayers();
+  }
+
+  function drawRouteOnMap(data) {
+    if (!mapInstanceRef.current) return;
+    clearLayers();
+    const map = mapInstanceRef.current;
+
+    // draw geometry if present
+    if (data.route_geometry && data.route_geometry.coordinates) {
+      const latlngs = data.route_geometry.coordinates.map((c) => [c[1], c[0]]);
+      const poly = L.polyline(latlngs, { color: "#1976d2", weight: 4 }).addTo(routeLayerRef.current);
+      map.fitBounds(poly.getBounds(), { padding: [40, 40] });
+    }
+
+    // draw sample markers
+    if (data.samples && Array.isArray(data.samples)) {
+      data.samples.forEach((s) => {
+        const emoji = weatherCodeToEmoji(s.weather_code);
+        const marker = L.marker([s.lat, s.lon], {
+          icon: L.divIcon({ className: "weather-marker", html: `<div style="font-size:20px">${emoji}</div>` })
+        }).addTo(markersLayerRef.current);
+        marker.bindPopup(`${emoji} ${s.arrival}`);
+      });
+    }
+  }
 
   return (
     <div style={s.shell}>
