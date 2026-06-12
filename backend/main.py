@@ -1,9 +1,12 @@
 import os
 import httpx
+import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List, Dict, Optional
 
 app = FastAPI(title="RoutePlan API")
 
@@ -17,6 +20,8 @@ app.add_middleware(
 OSRM_URL = os.environ.get("OSRM_URL", "http://router.project-osrm.org")
 NOMINATIM_URL = "https://nominatim.openstreetmap.org"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_CACHE: dict = {}
+CACHE_TTL = 60 * 60  # 1 hour
 
 
 class RouteRequest(BaseModel):
@@ -36,6 +41,8 @@ class RouteResponse(BaseModel):
     weather_summary: str
     traffic_summary: str
     advice: str
+    route_geometry: Optional[Dict] = None
+    samples: List[Dict] = []
 
 
 @app.get("/health")
@@ -84,21 +91,52 @@ def _is_good_weather_code(code: int) -> bool:
 async def _get_weather_code_at(lat: float, lon: float, when: datetime) -> int:
     """Query Open-Meteo hourly weathercode and return nearest-hour code."""
     date_str = when.date().isoformat()
-    async with httpx.AsyncClient() as client:
-        res = await client.get(
-            OPEN_METEO_URL,
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "hourly": "weathercode",
-                "timezone": "UTC",
-                "start_date": date_str,
-                "end_date": date_str,
-            },
-            timeout=10,
-        )
-        res.raise_for_status()
-        data = res.json()
+    cache_key = f"{lat:.4f},{lon:.4f},{date_str}"
+    now_ts = time.time()
+    # return cached if fresh
+    cached = WEATHER_CACHE.get(cache_key)
+    if cached and (now_ts - cached[0]) < CACHE_TTL:
+        data = cached[1]
+    else:
+        # retry on 429 with exponential backoff
+        backoff = 1
+        last_exc = None
+        for attempt in range(4):
+            try:
+                async with httpx.AsyncClient() as client:
+                    res = await client.get(
+                        OPEN_METEO_URL,
+                        params={
+                            "latitude": lat,
+                            "longitude": lon,
+                            "hourly": "weathercode",
+                            "timezone": "UTC",
+                            "start_date": date_str,
+                            "end_date": date_str,
+                        },
+                        timeout=10,
+                    )
+                    if res.status_code == 429:
+                        last_exc = httpx.HTTPStatusError("429 Too Many Requests", request=res.request, response=res)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    res.raise_for_status()
+                    data = res.json()
+                    # cache successful response
+                    WEATHER_CACHE[cache_key] = (time.time(), data)
+                    last_exc = None
+                    break
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+                await asyncio.sleep(backoff)
+                backoff *= 2
+            except Exception as e:
+                last_exc = e
+                await asyncio.sleep(backoff)
+                backoff *= 2
+        if last_exc is not None:
+            raise last_exc
         times = data.get("hourly", {}).get("time", [])
         codes = data.get("hourly", {}).get("weathercode", [])
         if not times or not codes:
@@ -215,11 +253,13 @@ async def plan_route(req: RouteRequest):
         for cand in candidates:
             good = 0
             total = len(sample_points)
+            sample_codes = []
             # assume linear time distribution along route
             for i, (plat, plon) in enumerate(sample_points):
                 frac = 0.0 if total == 1 else (i / (total - 1))
                 arrival = cand + timedelta(seconds=duration_seconds * frac)
                 code = await _get_weather_code_at(plat, plon, arrival)
+                sample_codes.append({"lat": plat, "lon": plon, "weather_code": code, "arrival": arrival.isoformat()})
                 if _is_good_weather_code(code):
                     good += 1
 
@@ -228,6 +268,7 @@ async def plan_route(req: RouteRequest):
                 best_score = score
                 best = cand
                 best_details = {"good": good, "total": total}
+                best_sample_codes = sample_codes
 
         recommended_depart_at = best.isoformat() if best is not None else desired.isoformat()
 
@@ -241,7 +282,9 @@ async def plan_route(req: RouteRequest):
             distance_km=round(distance_km, 2),
             weather_summary=weather_summary,
             traffic_summary="OSRM routing (no live traffic)",
-            advice=f"Recommended depart: {recommended_depart_at} (maximizes clear conditions)"
+            advice=f"Recommended depart: {recommended_depart_at} (maximizes clear conditions)",
+            route_geometry=geom,
+            samples=best_sample_codes if 'best_sample_codes' in locals() else []
         )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=500, detail=f"Route service error: {str(e)}")
