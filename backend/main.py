@@ -19,8 +19,8 @@ app.add_middleware(
 OSRM_URL = os.environ.get("OSRM_URL", "http://router.project-osrm.org")
 NOMINATIM_URL = "https://nominatim.openstreetmap.org"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-LLM_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-LLM_MODEL = "gpt-4o-mini"
+LLM_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+LLM_MODEL = "claude-3-5-sonnet-20241022"
 USE_LLM_RERANKER = os.environ.get("USE_LLM_RERANKER", "false").lower() == "true"
 
 
@@ -229,19 +229,22 @@ Return JSON only:
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": LLM_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
                 json={
                     "model": LLM_MODEL,
+                    "max_tokens": 1024,
                     "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.0,
-                    "max_tokens": 1000,
                 },
                 timeout=30,
             )
             res.raise_for_status()
             data = res.json()
-            content = data["choices"][0]["message"]["content"]
+            content = data["content"][0]["text"]
             result = json.loads(content)
             return result
     except Exception as e:
