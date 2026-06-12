@@ -1,6 +1,6 @@
 import os
 import httpx
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -23,6 +23,8 @@ class RouteRequest(BaseModel):
     origin: str
     destination: str
     depart_at: str | None = None  # ISO datetime, optional
+    tolerance_hours: int = 0  # +/- hours to search (0-8)
+    granularity_min: int = 15  # minutes between candidate departures
 
 
 class RouteResponse(BaseModel):
@@ -47,6 +49,7 @@ async def geocode(location: str) -> tuple[float, float]:
         res = await client.get(
             f"{NOMINATIM_URL}/search",
             params={"q": location, "format": "json", "limit": 1},
+            headers={"User-Agent": "RoutePlan/1.0"},
             timeout=10
         )
         res.raise_for_status()
@@ -61,11 +64,63 @@ async def get_route(origin_lat: float, origin_lon: float, dest_lat: float, dest_
     async with httpx.AsyncClient() as client:
         res = await client.get(
             f"{OSRM_URL}/route/v1/driving/{origin_lon},{origin_lat};{dest_lon},{dest_lat}",
-            params={"overview": "full", "steps": "true"},
+            params={"overview": "full", "steps": "true", "geometries": "geojson"},
             timeout=10
         )
         res.raise_for_status()
         return res.json()
+
+
+def _is_good_weather_code(code: int) -> bool:
+    """Return True for non-precipitating/clear-ish weather codes.
+    This is a conservative heuristic: treat only codes 0-3 as 'good'.
+    """
+    try:
+        return int(code) in (0, 1, 2, 3)
+    except Exception:
+        return False
+
+
+async def _get_weather_code_at(lat: float, lon: float, when: datetime) -> int:
+    """Query Open-Meteo hourly weathercode and return nearest-hour code."""
+    date_str = when.date().isoformat()
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            OPEN_METEO_URL,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": "weathercode",
+                "timezone": "UTC",
+                "start_date": date_str,
+                "end_date": date_str,
+            },
+            timeout=10,
+        )
+        res.raise_for_status()
+        data = res.json()
+        times = data.get("hourly", {}).get("time", [])
+        codes = data.get("hourly", {}).get("weathercode", [])
+        if not times or not codes:
+            # fallback: treat as unknown -> bad
+            return -1
+
+        # find nearest hour
+        from bisect import bisect_left
+
+        # times are ISO strings in UTC
+        time_objs = [datetime.fromisoformat(t).replace(tzinfo=timezone.utc) for t in times]
+        target = when.replace(tzinfo=timezone.utc)
+        idx = bisect_left(time_objs, target)
+        if idx == 0:
+            return int(codes[0])
+        if idx >= len(time_objs):
+            return int(codes[-1])
+        # pick closer of idx-1 and idx
+        before = time_objs[idx - 1]
+        after = time_objs[idx]
+        pick = idx - 1 if (target - before) <= (after - target) else idx
+        return int(codes[pick])
 
 
 async def get_weather(lat: float, lon: float) -> str:
@@ -94,32 +149,99 @@ async def plan_route(req: RouteRequest):
         # Geocode origin and destination
         origin_lat, origin_lon = await geocode(req.origin)
         dest_lat, dest_lon = await geocode(req.destination)
-        
-        # Get route from OSRM
+
+        # Get route from OSRM (route geometry + duration)
         route_data = await get_route(origin_lat, origin_lon, dest_lat, dest_lon)
-        
         if not route_data.get("routes"):
             raise HTTPException(status_code=400, detail="No route found")
-        
+
         route = route_data["routes"][0]
         distance_km = route["distance"] / 1000
-        duration_minutes = int(route["duration"] / 60)
-        
-        # Get weather at destination
-        weather = await get_weather(dest_lat, dest_lon)
-        
-        # For now, use simple logic - actual implementation would check weather and optimize timing
-        recommended_depart_at = req.depart_at or datetime.now().isoformat()
-        
+        duration_seconds = float(route["duration"])
+        duration_minutes = int(duration_seconds / 60)
+
+        # Extract coordinates from geojson geometry (lon, lat)
+        coords = []
+        geom = route.get("geometry")
+        if geom and isinstance(geom, dict) and geom.get("coordinates"):
+            coords = geom.get("coordinates")
+
+        # Sampling points along route (fall back to origin/dest if geometry missing)
+        sample_count = 6
+        sample_points = []
+        if coords:
+            L = len(coords)
+            if L == 1:
+                sample_points = [(coords[0][1], coords[0][0])]
+            else:
+                for i in range(sample_count):
+                    idx = int(round(i * (L - 1) / (sample_count - 1)))
+                    lon, lat = coords[idx]
+                    sample_points.append((lat, lon))
+        else:
+            sample_points = [(origin_lat, origin_lon), (dest_lat, dest_lon)]
+
+        # Candidate departure times
+        if req.depart_at:
+            try:
+                desired = datetime.fromisoformat(req.depart_at)
+                if desired.tzinfo is None:
+                    desired = desired.replace(tzinfo=timezone.utc)
+            except Exception:
+                desired = datetime.now(timezone.utc)
+        else:
+            desired = datetime.now(timezone.utc)
+
+        tol = max(0, min(8, int(req.tolerance_hours or 0)))
+        gran_min = max(1, int(req.granularity_min or 15))
+        step = timedelta(minutes=gran_min)
+        start = desired - timedelta(hours=tol)
+        end = desired + timedelta(hours=tol)
+
+        candidates = []
+        t = start
+        while t <= end:
+            candidates.append(t)
+            t += step
+
+        if not candidates:
+            candidates = [desired]
+
+        best = None
+        best_score = -1.0
+        best_details = None
+
+        # evaluate candidates
+        for cand in candidates:
+            good = 0
+            total = len(sample_points)
+            # assume linear time distribution along route
+            for i, (plat, plon) in enumerate(sample_points):
+                frac = 0.0 if total == 1 else (i / (total - 1))
+                arrival = cand + timedelta(seconds=duration_seconds * frac)
+                code = await _get_weather_code_at(plat, plon, arrival)
+                if _is_good_weather_code(code):
+                    good += 1
+
+            score = good / total if total > 0 else 0.0
+            if score > best_score:
+                best_score = score
+                best = cand
+                best_details = {"good": good, "total": total}
+
+        recommended_depart_at = best.isoformat() if best is not None else desired.isoformat()
+
+        weather_summary = f"{int(best_score*100)}% of sampled points good ({best_details['good']}/{best_details['total']})"
+
         return RouteResponse(
             origin=req.origin,
             destination=req.destination,
             recommended_depart_at=recommended_depart_at,
             duration_minutes=duration_minutes,
             distance_km=round(distance_km, 2),
-            weather_summary=weather,
-            traffic_summary="Real-time from OSRM route",
-            advice="Safe to depart as planned."
+            weather_summary=weather_summary,
+            traffic_summary="OSRM routing (no live traffic)",
+            advice=f"Recommended depart: {recommended_depart_at} (maximizes clear conditions)"
         )
     except httpx.HTTPError as e:
         raise HTTPException(status_code=500, detail=f"Route service error: {str(e)}")
