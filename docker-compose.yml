@@ -3,6 +3,8 @@ services:
     build: ./backend
     environment:
       - OSRM_URL=${OSRM_URL:-http://router.project-osrm.org}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - USE_LLM_RERANKER=${USE_LLM_RERANKER:-false}
     restart: unless-stopped
     network_mode: host
 
